@@ -10,24 +10,24 @@ def get_config():
     
     # Model settings
     config.MODEL.TYPE = 'swinv2'
-    config.MODEL.NAME = 'swinv2_base_patch4_window7_224'
+    config.MODEL.NAME = 'swinv2_tiny_patch4_window8_256'
     config.MODEL.SWINV2 = config.MODEL.SWIN
     config.MODEL.SWINV2.PATCH_SIZE = 4
     config.MODEL.SWINV2.IN_CHANS = 3
-    config.MODEL.SWINV2.EMBED_DIM = 128
-    config.MODEL.SWINV2.DEPTHS = [2, 2, 18, 2]
-    config.MODEL.SWINV2.NUM_HEADS = [4, 8, 16, 32]
-    config.MODEL.SWINV2.WINDOW_SIZE = 7
+    config.MODEL.SWINV2.EMBED_DIM = 96
+    config.MODEL.SWINV2.DEPTHS = [2, 2, 6, 2]
+    config.MODEL.SWINV2.NUM_HEADS = [2, 6, 12, 4]
+    config.MODEL.SWINV2.WINDOW_SIZE = 8
     config.MODEL.SWINV2.MLP_RATIO = 4.
     config.MODEL.SWINV2.QKV_BIAS = True
     config.MODEL.SWINV2.APE = False
     config.MODEL.SWINV2.PATCH_NORM = True
     config.MODEL.DROP_RATE = 0.0
-    config.MODEL.DROP_PATH_RATE = 0.1
+    config.MODEL.DROP_PATH_RATE = 0.2
     
     # Data settings
     config.DATA.DATASET = 'brain_tumor'
-    config.DATA.DATA_PATH = '/Users/debasishborah/Downloads/brain-tumor-dataset'
+    config.DATA.DATA_PATH = ''
     config.DATA.IMG_SIZE = 224
     config.DATA.MASK_PATCH_SIZE = 32
     config.DATA.MASK_RATIO = 0.6

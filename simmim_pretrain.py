@@ -12,6 +12,13 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.cuda.amp
+from torch.utils.tensorboard import SummaryWriter
+
+import torch
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.cuda.amp
+from torch.utils.tensorboard import SummaryWriter
 
 from timm.utils import AverageMeter
 
@@ -172,6 +179,12 @@ def main():
     from logger import create_logger
     logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank() if distributed else 0, name=f"{config.MODEL.NAME}")
     
+    # Initialize tensorboard writer
+    if dist.get_rank() == 0:
+        writer = SummaryWriter(os.path.join(config.OUTPUT, 'tensorboard'))
+    else:
+        writer = None
+    
     # Create data loader
     logger.info("Creating dataset")
     data_loader_train = build_simmim_loader(
@@ -238,7 +251,7 @@ def main():
         if distributed:
             data_loader_train.sampler.set_epoch(epoch)
         
-        train_one_epoch(config, model, data_loader_train, optimizer, epoch, lr_scheduler, scaler, logger)
+        train_one_epoch(config, model, data_loader_train, optimizer, epoch, lr_scheduler, scaler, logger, writer)
         
         if (dist.get_rank() == 0 if distributed else True) and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, 0., optimizer, lr_scheduler, scaler, logger)
@@ -248,7 +261,7 @@ def main():
     logger.info('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler, scaler, logger):
+def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler, scaler, logger, writer=None):
     model.train()
     optimizer.zero_grad()
     
@@ -261,6 +274,9 @@ def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler, 
     start = time.time()
     end = time.time()
     device = next(model.parameters()).device
+
+    # Log sample images every 50 epochs
+    log_images = epoch % 50 == 0 or epoch == 0
     
     for idx, (img, mask, _) in enumerate(data_loader):
         img = img.to(device, non_blocking=True)
@@ -268,7 +284,7 @@ def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler, 
         
         # Use device-agnostic autocast instead of CUDA-specific one
         with torch.amp.autocast(device_type=device.type, enabled=config.ENABLE_AMP):
-            loss = model(img, mask)
+            loss, pred = model(img, mask, return_pred=True)
         
         if config.TRAIN.ACCUMULATION_STEPS > 1:
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
@@ -344,9 +360,37 @@ def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler, 
             f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
             f'loss_scale {loss_scale_meter.val:.4f} ({loss_scale_meter.avg:.4f})\t'
             f'mem {memory_used:.0f}MB')
-    
+        
+        # Log metrics to tensorboard
+        if writer is not None and dist.get_rank() == 0:
+            global_step = epoch * num_steps + idx
+            writer.add_scalar('train/loss', loss_meter.val, global_step)
+            writer.add_scalar('train/grad_norm', norm_meter.val, global_step)
+            writer.add_scalar('train/loss_scale', loss_scale_meter.val, global_step)
+            writer.add_scalar('train/lr', lr, global_step)
+            
+            # Log sample images and their reconstructions
+            if log_images and idx == 0:
+                # Get a sample batch
+                sample_img = img[:4].detach().cpu()  # Take first 4 images
+                sample_pred = pred[:4].detach().cpu()  # Take first 4 predictions
+                sample_mask = mask[:4].detach().cpu()  # Take first 4 masks
+                
+                # Create grid of original images
+                writer.add_images('train/original_images', sample_img, epoch)
+                # Create grid of reconstructed images
+                writer.add_images('train/reconstructed_images', sample_pred, epoch)
+                # Create grid of masks
+                writer.add_images('train/masks', sample_mask.unsqueeze(1).float(), epoch)
+
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
+    
+    # Log epoch metrics
+    if writer is not None and dist.get_rank() == 0:
+        writer.add_scalar('train/epoch_loss', loss_meter.avg, epoch)
+        writer.add_scalar('train/epoch_grad_norm', norm_meter.avg, epoch)
+        writer.add_scalar('train/epoch_loss_scale', loss_scale_meter.avg, epoch)
 
 
 if __name__ == '__main__':

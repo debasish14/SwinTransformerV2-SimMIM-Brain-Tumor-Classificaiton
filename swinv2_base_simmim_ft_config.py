@@ -16,6 +16,7 @@ def get_config():
     config.MODEL.SWINV2.EMBED_DIM = 128
     config.MODEL.SWINV2.DEPTHS = [2, 2, 18, 2]
     config.MODEL.SWINV2.NUM_HEADS = [4, 8, 16, 32]
+    config.MODEL.SWINV2.PRETRAINED_WINDOW_SIZES = [0, 0, 0, 0]
     config.MODEL.SWINV2.WINDOW_SIZE = 7
     config.MODEL.SWINV2.MLP_RATIO = 4.
     config.MODEL.SWINV2.QKV_BIAS = True
@@ -28,7 +29,7 @@ def get_config():
     
     # Data settings
     config.DATA.DATASET = 'brain_tumor'
-    config.DATA.DATA_PATH = '/Users/debasishborah/Downloads/brain-tumor-dataset'
+    config.DATA.DATA_PATH = ''
     config.DATA.IMG_SIZE = 224
     config.DATA.BATCH_SIZE = 32
     config.DATA.NUM_WORKERS = 8
@@ -67,6 +68,9 @@ def get_config():
     
     # Enable AMP
     config.ENABLE_AMP = True
+    
+    # Device settings
+    config.device = 'cuda'
     
     # Test settings
     config.TEST.CROP = True

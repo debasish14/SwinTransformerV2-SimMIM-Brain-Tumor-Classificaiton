@@ -8,6 +8,14 @@ import argparse
 import datetime
 import numpy as np
 
+from torch.utils.tensorboard import SummaryWriter
+import torchvision
+import sklearn.metrics as metrics
+import seaborn as sns
+import matplotlib.pyplot as plt
+import io
+from PIL import Image
+
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -164,6 +172,11 @@ def main():
     from logger import create_logger
     logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank() if distributed else 0, name=f"{config.MODEL.NAME}")
     
+    if dist.get_rank() == 0:
+        writer = SummaryWriter(os.path.join(config.OUTPUT, 'tensorboard'))
+    else:
+        writer = None
+    
     # Create data loaders
     logger.info("Creating dataset")
     train_dataset, val_dataset, data_loader_train, data_loader_val = build_classification_loader(
@@ -237,7 +250,7 @@ def main():
     # Load checkpoint if resume is specified
     if config.MODEL.RESUME:
         max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, scaler, logger)
-        acc1, acc5, loss = validate(config, data_loader_val, model, criterion, logger)
+        acc1, acc5, loss = validate(config, data_loader_val, model, criterion, logger, writer, epoch=0)
         logger.info(f"Accuracy of the network on the {len(val_dataset)} test images: {acc1:.1f}%")
         if config.EVAL_MODE:
             return
@@ -245,7 +258,7 @@ def main():
     # Load pretrained model if specified
     if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
         load_pretrained(config, model_without_ddp, logger)
-        acc1, acc5, loss = validate(config, data_loader_val, model, criterion, logger)
+        acc1, acc5, loss = validate(config, data_loader_val, model, criterion, logger, writer, epoch=0)
         logger.info(f"Accuracy of the network on the {len(val_dataset)} test images: {acc1:.1f}%")
     
     # Start training
@@ -255,12 +268,12 @@ def main():
         if distributed:
             data_loader_train.sampler.set_epoch(epoch)
         
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, lr_scheduler, scaler, logger)
+        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, lr_scheduler, scaler, logger, writer)
         
         if (dist.get_rank() == 0 if distributed else True) and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, scaler, logger)
         
-        acc1, acc5, loss = validate(config, data_loader_val, model, criterion, logger)
+        acc1, acc5, loss = validate(config, data_loader_val, model, criterion, logger, writer, epoch)
         logger.info(f"Accuracy of the network on the {len(val_dataset)} test images: {acc1:.1f}%")
         max_accuracy = max(max_accuracy, acc1)
         logger.info(f'Max accuracy: {max_accuracy:.2f}%')
@@ -270,7 +283,7 @@ def main():
     logger.info('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, lr_scheduler, scaler, logger):
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, lr_scheduler, scaler, logger, writer):
     model.train()
     optimizer.zero_grad()
     
@@ -293,7 +306,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, lr_
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         
-        with amp.autocast(enabled=config.ENABLE_AMP):
+        with torch.amp.autocast(enabled=config.ENABLE_AMP):
             outputs = model(samples)
             loss = criterion(outputs, targets)
         
@@ -377,12 +390,81 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, lr_
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'loss_scale {loss_scale_meter.val:.4f} ({loss_scale_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
+            
+            # Log metrics to tensorboard
+            if writer is not None and dist.get_rank() == 0:
+                global_step = epoch * num_steps + idx
+                writer.add_scalar('train/loss', loss_meter.val, global_step)
+                writer.add_scalar('train/acc1', acc1_meter.val, global_step)
+                writer.add_scalar('train/acc5', acc5_meter.val, global_step)
+                writer.add_scalar('train/grad_norm', norm_meter.val, global_step)
+                writer.add_scalar('train/loss_scale', loss_scale_meter.val, global_step)
+                writer.add_scalar('train/lr', lr, global_step)
+                
+                # Log sample images every 10 epochs
+                if epoch % 10 == 0 and idx == 0:
+                    grid = torchvision.utils.make_grid(samples[:8])
+                    writer.add_image('train/input_images', grid, epoch)
+                    
+                    # Visualize model predictions
+                    with torch.no_grad():
+                        # Get predictions
+                        _, predicted = torch.max(outputs.data, 1)
+                        
+                        # Create a figure to show images with predictions
+                        fig, axs = plt.subplots(2, 4, figsize=(16, 8))
+                        fig.suptitle(f'Predictions at Epoch {epoch}', fontsize=16)
+                        
+                        for i in range(min(8, len(samples))):
+                            row, col = i // 4, i % 4
+                            img = samples[i].cpu().permute(1, 2, 0)
+                            
+                            # Normalize for display if needed
+                            if img.max() <= 1:
+                                img = img * 255
+                            img = img.numpy().astype(np.uint8)
+                            
+                            # Display image and prediction
+                            axs[row, col].imshow(img)
+                            pred_class = predicted[i].item()
+                            true_class = targets[i].item()
+                            
+                            # Get class names if available
+                            class_names = getattr(data_loader.dataset, 'classes', None)
+                            if class_names and pred_class < len(class_names):
+                                pred_label = class_names[pred_class]
+                                true_label = class_names[true_class]
+                                title = f"Pred: {pred_label}\nTrue: {true_label}"
+                            else:
+                                title = f"Pred: {pred_class}\nTrue: {true_class}"
+                                
+                            # Color code correct/incorrect predictions
+                            color = 'green' if pred_class == true_class else 'red'
+                            axs[row, col].set_title(title, color=color)
+                            axs[row, col].axis('off')
+                        
+                        # Convert plot to image and log to tensorboard
+                        buf = io.BytesIO()
+                        plt.savefig(buf, format='png')
+                        buf.seek(0)
+                        image = Image.open(buf)
+                        image = torchvision.transforms.ToTensor()(image)
+                        writer.add_image('train/predictions', image, epoch)
+                        plt.close(fig)
     
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
+    
+    # Log epoch metrics
+    if writer is not None and dist.get_rank() == 0:
+        writer.add_scalar('train/epoch_loss', loss_meter.avg, epoch)
+        writer.add_scalar('train/epoch_acc1', acc1_meter.avg, epoch)
+        writer.add_scalar('train/epoch_acc5', acc5_meter.avg, epoch)
+        writer.add_scalar('train/epoch_grad_norm', norm_meter.avg, epoch)
+        writer.add_scalar('train/epoch_loss_scale', loss_scale_meter.avg, epoch)
 
 
-def validate(config, data_loader, model, criterion, logger):
+def validate(config, data_loader, model, criterion, logger, writer, epoch):
     model.eval()
     
     batch_time = AverageMeter()
@@ -394,15 +476,28 @@ def validate(config, data_loader, model, criterion, logger):
     
     device = next(model.parameters()).device
     
+    # For confusion matrix
+    predictions = []
+    targets_list = []
+    
     with torch.no_grad():
         for idx, (images, target) in enumerate(data_loader):
             images = images.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             
             # compute output
-            with amp.autocast(enabled=config.ENABLE_AMP):
+            with torch.amp.autocast(enabled=config.ENABLE_AMP):
                 output = model(images)
-                loss = criterion(output, target)
+                
+                # Handle different criterion types
+                if isinstance(criterion, SoftTargetCrossEntropy):
+                    # For SoftTargetCrossEntropy, convert targets to one-hot
+                    target_one_hot = torch.zeros(target.size(0), config.MODEL.NUM_CLASSES, device=device)
+                    target_one_hot.scatter_(1, target.unsqueeze(1), 1)
+                    loss = criterion(output, target_one_hot)
+                else:
+                    # For standard cross entropy
+                    loss = criterion(output, target)
             
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, min(5, config.MODEL.NUM_CLASSES)))
@@ -415,6 +510,10 @@ def validate(config, data_loader, model, criterion, logger):
             loss_meter.update(loss.item(), target.size(0))
             acc1_meter.update(acc1.item(), target.size(0))
             acc5_meter.update(acc5.item(), target.size(0))
+            
+            # Collect predictions and targets for confusion matrix
+            predictions.extend(output.argmax(dim=1).cpu().numpy())
+            targets_list.extend(target.cpu().numpy())
             
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -431,6 +530,33 @@ def validate(config, data_loader, model, criterion, logger):
                     f'Mem {memory_used:.0f}MB')
     
     logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
+    
+    # Log metrics to tensorboard
+    if writer is not None and dist.get_rank() == 0:
+        writer.add_scalar('test/loss', loss_meter.avg, epoch)
+        writer.add_scalar('test/acc1', acc1_meter.avg, epoch)
+        writer.add_scalar('test/acc5', acc5_meter.avg, epoch)
+        
+        # Create and log confusion matrix
+        try:
+            cm = metrics.confusion_matrix(targets_list, predictions)
+            fig, ax = plt.subplots(figsize=(10, 10))
+            sns.heatmap(cm, annot=True, fmt='d', ax=ax)
+            plt.title('Confusion Matrix')
+            plt.ylabel('True Label')
+            plt.xlabel('Predicted Label')
+            
+            # Convert plot to image
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            image = Image.open(buf)
+            image = torchvision.transforms.ToTensor()(image)
+            writer.add_image('test/confusion_matrix', image, epoch)
+            plt.close()
+        except Exception as e:
+            logger.info(f"Error creating confusion matrix: {e}")
+    
     return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
 
 

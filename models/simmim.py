@@ -128,8 +128,8 @@ class SimMIM(nn.Module):
 
         self.in_chans = in_chans
         self.patch_size = patch_size
-
-    def forward(self, x, mask):
+        
+    def forward(self, x, mask, return_pred=False):
         z = self.encoder(x, mask)
         x_rec = self.decoder(z)
 
@@ -143,6 +143,9 @@ class SimMIM(nn.Module):
         
         loss_recon = F.l1_loss(x, x_rec, reduction='none')
         loss = (loss_recon * mask).sum() / (mask.sum() + 1e-5) / self.in_chans
+        
+        if return_pred:
+            return loss, x_rec
         return loss
 
     @torch.jit.ignore

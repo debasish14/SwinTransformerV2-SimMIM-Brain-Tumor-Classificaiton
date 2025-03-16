@@ -63,7 +63,7 @@ def load_pretrained(config, model, logger):
         model_state_dict = checkpoint
     
     # Delete head weights if num_classes don't match
-    if hasattr(model, 'head') and hasattr(model.head, 'weight') and model.head.weight.shape[0] != model_state_dict['head.weight'].shape[0]:
+    if hasattr(model, 'head') and hasattr(model.head, 'weight') and 'head.weight' in model_state_dict and model.head.weight.shape[0] != model_state_dict['head.weight'].shape[0]:
         logger.warning(f"Removing head weights from pretrained model (different number of classes)")
         del model_state_dict['head.weight']
         del model_state_dict['head.bias']
